@@ -1,0 +1,512 @@
+# camcookie_installer.py
+# Camcookie Pi Installer — with Internet Required page
+#
+# Features:
+# - Internet check page (must be online to continue)
+# - Blue-themed Tkinter UI with vector logo (no external assets)
+# - Terms & Privacy gate (Raspberry Pi links + consent)
+# - Stream ZIP download into memory, extract directly (no ZIP left behind)
+# - Prompt then wipe all existing files on target drive/folder before install
+# - Progress bar, status updates, and friendly error messages
+
+
+import os
+import json
+import zipfile
+import ctypes
+import threading
+import webbrowser
+from io import BytesIO
+
+import tkinter as tk
+from tkinter import ttk, messagebox, filedialog
+
+try:
+    import requests
+except ImportError:
+    raise SystemExit("Please install dependencies: pip install requests")
+
+# -------- Configuration --------
+APP_NAME   = "Camcookie Pi Installer"
+V_JSON_URL = "https://camcookie876.github.io/PI-s/V.json"
+
+TERMS_TEXT = """
+Raspberry Pi Terms and Privacy (PLACEHOLDER)
+
+Before proceeding, you must review and accept the official Raspberry Pi terms and privacy policy.
+Please open the links below to view the current official documents:
+
+- Raspberry Pi Software terms: https://www.raspberrypi.com/software/
+- Raspberry Pi Privacy Policy:   https://www.raspberrypi.org/privacy/
+
+By checking "I have read and agree", you confirm you accept the applicable terms and policies.
+"""
+
+# Theme colors
+COLOR_BG     = "#0b1736"
+COLOR_FG     = "#e6ecff"
+COLOR_SUB    = "#cfe2ff"
+COLOR_ACCENT = "#1e6bff"
+COLOR_EDGE   = "#0b2e6b"
+
+# -------- Utilities --------
+def center_window(win, w=720, h=520):
+    win.update_idletasks()
+    sw, sh = win.winfo_screenwidth(), win.winfo_screenheight()
+    x, y = (sw - w) // 2, (sh - h) // 2
+    win.geometry(f"{w}x{h}+{x}+{y}")
+    win.minsize(640, 480)
+
+def list_removable_drives():
+    drives = []
+    kernel32 = ctypes.windll.kernel32
+    bitmask = kernel32.GetLogicalDrives()
+    DRIVE_REMOVABLE = 2
+    for i in range(26):
+        if bitmask & (1 << i):
+            letter = f"{chr(65 + i)}:\\"
+            dtype = kernel32.GetDriveTypeW(ctypes.c_wchar_p(letter))
+            if dtype == DRIVE_REMOVABLE:
+                drives.append(letter)
+    return drives
+
+def human_size(nbytes: int) -> str:
+    step = 1024.0
+    for unit in ["B", "KB", "MB", "GB", "TB"]:
+        if nbytes < step:
+            return f"{nbytes:.1f} {unit}"
+        nbytes /= step
+    return f"{nbytes:.1f} PB"
+
+# -------- Networking --------
+def check_online(url: str, timeout=6) -> bool:
+    try:
+        # HEAD is not always allowed on static hosts; use a small GET
+        r = requests.get(url, timeout=timeout)
+        return r.status_code == 200
+    except Exception:
+        return False
+
+def fetch_versions(url: str):
+    r = requests.get(url, timeout=20)
+    r.raise_for_status()
+    data = r.json()
+    versions = data.get("versions") or []
+    return versions
+
+def stream_download(url: str, chunk_cb, total_cb):
+    with requests.get(url, stream=True, timeout=30) as r:
+        r.raise_for_status()
+        total = int(r.headers.get("Content-Length", "0") or 0)
+        total_cb(total)
+        downloaded = 0
+        for chunk in r.iter_content(chunk_size=1 << 15):  # 32KB
+            if not chunk:
+                continue
+            downloaded += len(chunk)
+            chunk_cb(chunk, downloaded, total)
+
+# -------- UI Components --------
+class Header(tk.Frame):
+    def __init__(self, parent):
+        super().__init__(parent, bg=COLOR_BG)
+        self.canvas = tk.Canvas(self, height=100, bg=COLOR_BG, highlightthickness=0)
+        self.canvas.pack(fill="x", padx=16, pady=(16, 8))
+        self._draw_logo()
+        tk.Label(self, text=APP_NAME, bg=COLOR_BG, fg=COLOR_SUB,
+                 font=("Segoe UI Semibold", 18)).pack(padx=16, pady=(0, 12), anchor="w")
+
+    def _draw_logo(self):
+        c = self.canvas
+        cx, cy, r = 70, 50, 30
+        stroke, width = COLOR_ACCENT, 3
+        # Body
+        c.create_oval(cx - r, cy - r, cx + r, cy + r, outline=stroke, width=width)
+        # Eye
+        c.create_oval(cx + 10, cy - 5, cx + 14, cy - 1, outline=stroke, width=width)
+        # Beak
+        c.create_polygon(cx + r, cy - 4, cx + r + 16, cy, cx + r, cy + 4, outline=stroke, fill="", width=width)
+        # Wing arc
+        c.create_arc(cx - 12, cy - 8, cx + 22, cy + 28, start=200, extent=120, style="arc", outline=stroke, width=width)
+
+# ---- Frames ----
+class InternetFrame(ttk.Frame):
+    def __init__(self, parent, ctrl):
+        super().__init__(parent, style="Cam.TFrame")
+        self.ctrl = ctrl
+
+        ttk.Label(self, text="Internet connection required",
+                  style="Cam.Title.TLabel").pack(padx=16, pady=(24, 8), anchor="w")
+
+        self.info = ttk.Label(
+            self,
+            text="This installer needs an internet connection to load versions and download files.\n"
+                 "Please connect to the internet, then click Retry.",
+            style="Cam.TLabel", wraplength=680, justify="left"
+        )
+        self.info.pack(padx=16, pady=(4, 8), anchor="w")
+
+        self.status = ttk.Label(self, text="Checking connection…", style="Cam.TLabel")
+        self.status.pack(padx=16, pady=(4, 8), anchor="w")
+
+        btns = ttk.Frame(self, style="Cam.TFrame")
+        btns.pack(fill="x", padx=16, pady=(12, 16))
+
+        self.retry_btn = ttk.Button(btns, text="Retry", style="Cam.TButton", command=self.retry_check)
+        self.retry_btn.pack(side="left")
+
+        self.continue_btn = ttk.Button(btns, text="Continue", style="Cam.TButton",
+                                       command=lambda: ctrl.show_frame("WelcomeFrame"), state="disabled")
+        self.continue_btn.pack(side="right")
+
+        # Optional: quick link to troubleshoot network
+        help_link = ttk.Label(self, text="Open network settings help", style="Cam.Link.TLabel", cursor="hand2")
+        help_link.pack(padx=16, pady=(0, 8), anchor="w")
+        help_link.bind("<Button-1>", lambda e: webbrowser.open("ms-settings:network"))
+
+        self.after(200, self.retry_check)
+
+    def retry_check(self):
+        self.status.config(text="Checking connection…")
+        self.continue_btn["state"] = "disabled"
+        def worker():
+            online = check_online(V_JSON_URL)
+            self.ctrl.safe_call(lambda: self._update_status(online))
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _update_status(self, online: bool):
+        if online:
+            self.status.config(text="Online. You can continue.")
+            self.continue_btn["state"] = "normal"
+        else:
+            self.status.config(text="Offline. Please connect to the internet and retry.")
+            self.continue_btn["state"] = "disabled"
+
+class WelcomeFrame(ttk.Frame):
+    def __init__(self, parent, ctrl):
+        super().__init__(parent, style="Cam.TFrame")
+        ttk.Label(self, text="Welcome — set up your Raspberry Pi with Camcookie",
+                  style="Cam.Title.TLabel").pack(padx=16, pady=(24, 12), anchor="w")
+        ttk.Label(
+            self,
+            text="This installer will fetch the Camcookie Pi package and install it onto your Pi’s storage.",
+            style="Cam.TLabel", wraplength=680, justify="left"
+        ).pack(padx=16, pady=6, anchor="w")
+        ttk.Button(self, text="Continue", style="Cam.TButton",
+                   command=lambda: ctrl.show_frame("TermsFrame")).pack(padx=16, pady=(24, 12), anchor="e")
+
+class TermsFrame(ttk.Frame):
+    def __init__(self, parent, ctrl):
+        super().__init__(parent, style="Cam.TFrame")
+        self.ctrl = ctrl
+        ttk.Label(self, text="Raspberry Pi Terms and Privacy",
+                  style="Cam.Title.TLabel").pack(padx=16, pady=(24, 8), anchor="w")
+
+        links = ttk.Frame(self, style="Cam.TFrame"); links.pack(padx=16, pady=4, anchor="w")
+        l1 = ttk.Label(links, text="Open Raspberry Pi Software page", style="Cam.Link.TLabel", cursor="hand2")
+        l1.pack(side="left", padx=(0, 16))
+        l1.bind("<Button-1>", lambda e: webbrowser.open("https://www.raspberrypi.com/software/"))
+        l2 = ttk.Label(links, text="Open Raspberry Pi Privacy Policy", style="Cam.Link.TLabel", cursor="hand2")
+        l2.pack(side="left")
+        l2.bind("<Button-1>", lambda e: webbrowser.open("https://www.raspberrypi.org/privacy/"))
+
+        txt = tk.Text(self, height=12, wrap="word", bg=COLOR_BG, fg=COLOR_FG, insertbackground=COLOR_FG,
+                      relief="solid", bd=1, highlightthickness=0)
+        txt.pack(padx=16, pady=(8, 4), fill="both", expand=True)
+        txt.insert("1.0", TERMS_TEXT)
+        txt.configure(state="disabled")
+
+        self.accept = tk.BooleanVar(False)
+        ttk.Checkbutton(self, text="I have read and agree to the terms.",
+                        variable=self.accept, style="Cam.Check.TButton").pack(padx=16, pady=(8, 8), anchor="w")
+
+        btns = ttk.Frame(self, style="Cam.TFrame"); btns.pack(fill="x", padx=16, pady=(8, 16))
+        ttk.Button(btns, text="Back", style="Cam.TButton",
+                   command=lambda: ctrl.show_frame("WelcomeFrame")).pack(side="left")
+        ttk.Button(btns, text="Continue", style="Cam.TButton",
+                   command=self._next).pack(side="right")
+
+    def _next(self):
+        if not self.accept.get():
+            messagebox.showwarning(APP_NAME, "You must accept before continuing.")
+            return
+        self.ctrl.show_frame("VersionFrame")
+
+class VersionFrame(ttk.Frame):
+    def __init__(self, parent, ctrl):
+        super().__init__(parent, style="Cam.TFrame")
+        self.ctrl = ctrl
+        ttk.Label(self, text="Select Camcookie Pi Version",
+                  style="Cam.Title.TLabel").pack(padx=16, pady=(24, 12), anchor="w")
+
+        self.info = ttk.Label(self, text="Fetching versions…", style="Cam.TLabel", wraplength=680, justify="left")
+        self.info.pack(padx=16, pady=4, anchor="w")
+
+        row = ttk.Frame(self, style="Cam.TFrame"); row.pack(padx=16, pady=(12, 8), fill="x")
+        ttk.Label(row, text="Version:", style="Cam.TLabel").pack(side="left")
+
+        self.ver_var = tk.StringVar()
+        self.combo = ttk.Combobox(row, textvariable=self.ver_var, width=40, state="readonly")
+        self.combo.pack(side="left", padx=(8, 16))
+
+        self.date_lbl = ttk.Label(row, text="", style="Cam.TLabel")
+        self.date_lbl.pack(side="left")
+
+        btns = ttk.Frame(self, style="Cam.TFrame"); btns.pack(fill="x", padx=16, pady=(16, 16))
+        ttk.Button(btns, text="Back", style="Cam.TButton",
+                   command=lambda: ctrl.show_frame("TermsFrame")).pack(side="left")
+        self.next_btn = ttk.Button(btns, text="Continue", style="Cam.TButton",
+                                   command=self._next, state="disabled")
+        self.next_btn.pack(side="right")
+
+        self.versions = []
+        self.after(200, self._load_versions)
+
+    def _load_versions(self):
+        def worker():
+            try:
+                vs = fetch_versions(V_JSON_URL)
+                self.ctrl.safe_call(lambda: self._populate(vs))
+            except Exception as e:
+                self.ctrl.safe_call(lambda: self.info.config(text=f"Error loading versions.\n{e}"))
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _populate(self, vs):
+        if not vs:
+            self.info.config(text="No versions found in V.json.")
+            return
+        self.versions = vs
+        names = [v.get("name", "Unnamed") for v in vs]
+        self.combo["values"] = names
+        self.combo.current(0)
+        self.combo.bind("<<ComboboxSelected>>", self._on_sel)
+        self._on_sel()
+        self.next_btn["state"] = "normal"
+        self.info.config(text="Choose a version to install.")
+
+    def _on_sel(self, event=None):
+        sel = self.ver_var.get()
+        v = next((x for x in self.versions if x.get("name") == sel), {})
+        date = v.get("date", "")
+        self.date_lbl.config(text=f"Release date: {date}" if date else "")
+
+    def _next(self):
+        if not self.ver_var.get():
+            messagebox.showwarning(APP_NAME, "Select a version.")
+            return
+        self.ctrl.selected_version = next(x for x in self.versions if x.get("name") == self.ver_var.get())
+        self.ctrl.show_frame("InstallFrame")
+
+class InstallFrame(ttk.Frame):
+    def __init__(self, parent, ctrl):
+        super().__init__(parent, style="Cam.TFrame")
+        self.ctrl = ctrl
+
+        ttk.Label(self, text="Choose Pi Storage and Install",
+                  style="Cam.Title.TLabel").pack(padx=16, pady=(24, 10), anchor="w")
+
+        pick = ttk.Frame(self, style="Cam.TFrame"); pick.pack(padx=16, pady=(8, 8), fill="x")
+        ttk.Label(pick, text="Detected removable drives:", style="Cam.TLabel").pack(side="left")
+        self.drive_var = tk.StringVar()
+        self.drive_combo = ttk.Combobox(pick, textvariable=self.drive_var, width=12, state="readonly")
+        self.drive_combo.pack(side="left", padx=(8, 16))
+        ttk.Button(pick, text="Refresh", style="Cam.TButton", command=self._refresh).pack(side="left")
+
+        ttk.Separator(self, orient="horizontal").pack(fill="x", padx=16, pady=(12, 12))
+
+        alt = ttk.Frame(self, style="Cam.TFrame"); alt.pack(padx=16, pady=(0, 8), fill="x")
+        ttk.Label(alt, text="Or pick folder manually:", style="Cam.TLabel").pack(side="left")
+        self.path_var = tk.StringVar()
+        ttk.Entry(alt, textvariable=self.path_var, width=48).pack(side="left", padx=(8, 8))
+        ttk.Button(alt, text="Browse…", style="Cam.TButton", command=self._browse).pack(side="left")
+
+        self.status = ttk.Label(self, text="", style="Cam.TLabel", wraplength=680, justify="left")
+        self.status.pack(padx=16, pady=(12, 6), anchor="w")
+
+        pb = ttk.Frame(self, style="Cam.TFrame"); pb.pack(padx=16, pady=(6, 4), fill="x")
+        self.pbar = ttk.Progressbar(pb, orient="horizontal", mode="determinate", length=520)
+        self.pbar.pack(side="left", expand=True, fill="x")
+        self.pct = ttk.Label(pb, text="", style="Cam.TLabel"); self.pct.pack(side="left", padx=(8, 0))
+
+        btns = ttk.Frame(self, style="Cam.TFrame"); btns.pack(fill="x", padx=16, pady=(16, 16))
+        ttk.Button(btns, text="Back", style="Cam.TButton",
+                   command=lambda: ctrl.show_frame("VersionFrame")).pack(side="left")
+        self.install_btn = ttk.Button(btns, text="Install", style="Cam.TButton", command=self._install)
+        self.install_btn.pack(side="right")
+
+        self._refresh()
+
+    def _refresh(self):
+        drives = list_removable_drives()
+        self.drive_combo["values"] = drives
+        if drives:
+            self.drive_combo.current(0)
+
+    def _browse(self):
+        p = filedialog.askdirectory(title="Select Pi SD Card Folder")
+        if p:
+            self.path_var.set(p)
+
+    def _resolve_target(self):
+        return self.path_var.get() or self.drive_var.get() or ""
+
+    def _wipe_target(self, t):
+        for root, dirs, files in os.walk(t, topdown=False):
+            for f in files:
+                try:
+                    os.remove(os.path.join(root, f))
+                except Exception:
+                    pass
+            for d in dirs:
+                try:
+                    os.rmdir(os.path.join(root, d))
+                except Exception:
+                    pass
+
+    def _install(self):
+        target = self._resolve_target()
+        if not target:
+            messagebox.showwarning(APP_NAME, "Select a drive or folder.")
+            return
+        ver = self.ctrl.selected_version
+        if not ver or not ver.get("url"):
+            messagebox.showwarning(APP_NAME, "No version selected.")
+            return
+
+        # Confirm wipe
+        if not messagebox.askyesno(
+            APP_NAME,
+            "⚠️ All existing files on the selected drive/folder will be permanently deleted.\n\n"
+            "Have you backed up anything important?\n\n"
+            "Proceed with wiping and installing?"
+        ):
+            return
+
+        self.status.config(text="Wiping existing files…")
+        self.install_btn["state"] = "disabled"
+        self.ctrl.safe_call(lambda: self.status.update())
+        self._wipe_target(target)
+
+        # Begin download+extract (in-memory)
+        url = ver["url"]
+        self.status.config(text=f"Downloading {ver.get('name','selected version')}…")
+        self.pbar["value"] = 0
+        self.pct.config(text="0%")
+
+        def worker():
+            try:
+                buf = BytesIO()
+                total_size = 0
+
+                def total_cb(tot):
+                    nonlocal total_size
+                    total_size = tot
+                    if tot:
+                        self.ctrl.safe_call(lambda: self.status.config(
+                            text=f"Downloading {ver.get('name','selected version')} ({human_size(tot)})"
+                        ))
+
+                def chunk_cb(chunk, dn, tot):
+                    buf.write(chunk)
+                    if tot:
+                        pct = int(dn * 100 / tot)
+                        self.ctrl.safe_call(lambda: self._update_progress(pct))
+
+                stream_download(url, chunk_cb, total_cb)
+
+                self.ctrl.safe_call(lambda: self.status.config(text="Extracting package…"))
+                buf.seek(0)
+                with zipfile.ZipFile(buf) as zf:
+                    for member in zf.infolist():
+                        safe = member.filename.replace("\\", "/")
+                        if safe.startswith("../") or ".." in safe.split("/"):
+                            continue
+                        dest = os.path.normpath(os.path.join(target, safe))
+                        if member.is_dir():
+                            os.makedirs(dest, exist_ok=True)
+                            continue
+                        os.makedirs(os.path.dirname(dest), exist_ok=True)
+                        with zf.open(member) as src, open(dest, "wb") as dst:
+                            dst.write(src.read())
+
+                self.ctrl.safe_call(lambda: (
+                    self.status.config(text="✅ Install complete! Eject card and boot your Pi."),
+                    self._finish()
+                ))
+            except Exception as e:
+                self.ctrl.safe_call(lambda: self._fail(str(e)))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _update_progress(self, pct):
+        self.pbar["value"] = pct
+        self.pct.config(text=f"{pct}%")
+
+    def _finish(self):
+        self.install_btn["state"] = "normal"
+        self.ctrl.show_frame("DoneFrame")
+
+    def _fail(self, msg):
+        self.install_btn["state"] = "normal"
+        messagebox.showerror(APP_NAME, f"Install failed:\n{msg}")
+        self.status.config(text="Install failed. Please try again.")
+
+class DoneFrame(ttk.Frame):
+    def __init__(self, parent, ctrl):
+        super().__init__(parent, style="Cam.TFrame")
+        ttk.Label(self, text="All set — Camcookie is ready on your Pi storage!",
+                  style="Cam.Title.TLabel").pack(padx=16, pady=(32, 8), anchor="w")
+        ttk.Label(self, text="Eject the SD card safely, insert it into your Raspberry Pi, and power on.",
+                  style="Cam.TLabel", wraplength=680, justify="left").pack(padx=16, pady=(8, 12), anchor="w")
+        ttk.Button(self, text="Finish", style="Cam.TButton", command=ctrl.quit)\
+            .pack(padx=16, pady=(16, 16), anchor="e")
+
+# -------- App Controller --------
+class App(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title(APP_NAME)
+        self.configure(bg=COLOR_BG)
+        center_window(self)
+
+        style = ttk.Style(self)
+        style.theme_use("clam")
+        style.configure("Cam.TFrame", background=COLOR_BG)
+        style.configure("Cam.TLabel", background=COLOR_BG, foreground=COLOR_FG, font=("Segoe UI", 11))
+        style.configure("Cam.Title.TLabel", background=COLOR_BG, foreground=COLOR_SUB, font=("Segoe UI Semibold", 16))
+        style.configure("Cam.TButton", font=("Segoe UI", 10))
+        style.map("Cam.TButton",
+                  background=[("active", COLOR_ACCENT)],
+                  foreground=[("!disabled", "#0b1736"), ("disabled", "#7a8cab")])
+        style.configure("Cam.Link.TLabel", background=COLOR_BG, foreground=COLOR_ACCENT,
+                        font=("Segoe UI", 10, "underline"))
+
+        self.header = Header(self)
+        self.header.pack(fill="x")
+
+        container = ttk.Frame(self, style="Cam.TFrame")
+        container.pack(fill="both", expand=True)
+
+        self.frames = {}
+        for F in (InternetFrame, WelcomeFrame, TermsFrame, VersionFrame, InstallFrame, DoneFrame):
+            name = F.__name__
+            frame = F(container, self)
+            self.frames[name] = frame
+            frame.grid(row=0, column=0, sticky="nsew")
+        container.grid_rowconfigure(0, weight=1)
+        container.grid_columnconfigure(0, weight=1)
+
+        self.selected_version = None
+        self.show_frame("InternetFrame")
+
+    def show_frame(self, name):
+        self.frames[name].tkraise()
+
+    def safe_call(self, fn):
+        self.after(0, fn)
+
+def main():
+    App().mainloop()
+
+if __name__ == "__main__":
+    main()
