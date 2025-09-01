@@ -1,0 +1,116 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Futcher Camcokie - PI Projects</title>
+    <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@700&family=Roboto:wght@400;700&display=swap" rel="stylesheet">
+    <style>
+        body {
+            font-family: 'Roboto', Arial, sans-serif;
+            margin: 0;
+            padding: 0;
+            background: linear-gradient(135deg, #1e293b 0%, #3b82f6 100%);
+            min-height: 100vh;
+            color: #f1f5f9;
+        }
+        header {
+            background: rgba(30, 41, 59, 0.95);
+            padding: 2em 0 1em 0;
+            text-align: center;
+            box-shadow: 0 4px 24px rgba(0,0,0,0.15);
+        }
+        h1 {
+            font-family: 'Orbitron', Arial, sans-serif;
+            font-size: 2.5em;
+            letter-spacing: 2px;
+            color: #38bdf8;
+            margin: 0 0 0.25em 0;
+        }
+        p {
+            font-size: 1.2em;
+            color: #cbd5e1;
+            margin: 0 0 1em 0;
+        }
+        .buttons {
+            margin: 3em auto 0 auto;
+            display: flex;
+            flex-wrap: wrap;
+            gap: 2em;
+            justify-content: center;
+            max-width: 900px;
+        }
+        .btn {
+            padding: 1.2em 2.5em;
+            background: linear-gradient(90deg, #38bdf8 0%, #6366f1 100%);
+            color: #fff;
+            border: none;
+            border-radius: 1.5em;
+            text-decoration: none;
+            font-size: 1.15em;
+            font-family: 'Orbitron', Arial, sans-serif;
+            font-weight: 700;
+            letter-spacing: 1px;
+            box-shadow: 0 2px 12px rgba(56,189,248,0.15);
+            cursor: pointer;
+            transition: transform 0.15s, box-shadow 0.15s, background 0.2s;
+            position: relative;
+            overflow: hidden;
+        }
+        .btn:hover {
+            transform: translateY(-4px) scale(1.04);
+            box-shadow: 0 8px 32px rgba(99,102,241,0.25);
+            background: linear-gradient(90deg, #6366f1 0%, #38bdf8 100%);
+        }
+        .btn::after {
+            content: '';
+            display: block;
+            position: absolute;
+            left: 50%;
+            top: 50%;
+            width: 0;
+            height: 0;
+            background: rgba(255,255,255,0.15);
+            border-radius: 100%;
+            transform: translate(-50%, -50%);
+            transition: width 0.3s, height 0.3s;
+            z-index: 0;
+        }
+        .btn:active::after {
+            width: 200%;
+            height: 200%;
+        }
+        @media (max-width: 600px) {
+            .buttons {
+                flex-direction: column;
+                gap: 1em;
+            }
+            .btn {
+                width: 100%;
+                text-align: center;
+            }
+        }
+        footer {
+            margin-top: 4em;
+            text-align: center;
+            color: #64748b;
+            font-size: 0.95em;
+            opacity: 0.7;
+        }
+    </style>
+</head>
+<body>
+    <header>
+        <h1>Futcher Camcokie</h1>
+        <p>Welcome to the PI Projects hub for Rutcher products.<br>
+        Explore the files and resources below!</p>
+    </header>
+    <div class="buttons">
+        <!-- Replace these with actual file names in the FP folder -->
+        <a class="btn" href="#">Require update! This is unavalable!</a>
+        <!-- Add more buttons as needed -->
+    </div>
+    <footer>
+        &copy; 2025 Futcher Camcokie for PI Projects &mdash; Rutcher Products
+    </footer>
+</body>
+</html>
